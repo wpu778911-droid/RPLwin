@@ -1,0 +1,643 @@
+from typing import Optional, Sequence, Tuple
+
+import numpy as np
+from gym import spaces
+
+from gops.env.env_gen_ocp.pyth_base import Context, ContextState, Env, Robot, State
+
+STEER_LIMIT = np.deg2rad(170.0)
+STEER_RATE_MAX = np.deg2rad(120.0)
+WHEEL_ACC_MAX = 1.0
+
+BALL_SPEED = 0.1
+RECT_W = 2.5
+RECT_H = 1.5
+CORNER_R = 0.3
+WHEEL_POS = {
+    "FR": (+0.24, -0.175),
+    "RR": (-0.24, -0.175),
+    "RL": (-0.24, +0.175),
+    "FL": (+0.24, +0.175),
+}
+WHEEL_ORDER = ("FR", "RR", "RL", "FL")
+
+
+def wrap_to_pi(angle: float) -> float:
+    return (angle + np.pi) % (2.0 * np.pi) - np.pi
+
+
+def clip(x: np.ndarray, low: np.ndarray, high: np.ndarray) -> np.ndarray:
+    return np.minimum(np.maximum(x, low), high)
+
+
+def _rounded_rect_perimeter() -> float:
+    straight_x = 2.0 * (RECT_W - CORNER_R)
+    straight_y = 2.0 * (RECT_H - CORNER_R)
+    arc = 0.5 * np.pi * CORNER_R
+    return 2.0 * (straight_x + straight_y) + 4.0 * arc
+
+
+def _rounded_rect_pos_vel(s: float) -> Tuple[float, float, float, float]:
+    straight_x = 2.0 * (RECT_W - CORNER_R)
+    straight_y = 2.0 * (RECT_H - CORNER_R)
+    arc = 0.5 * np.pi * CORNER_R
+
+    if s < straight_x:
+        x = -RECT_W + CORNER_R + s
+        y = -RECT_H
+        dx, dy = BALL_SPEED, 0.0
+        return x, y, dx, dy
+    s -= straight_x
+
+    if s < arc:
+        theta = -0.5 * np.pi + s / CORNER_R
+        cx, cy = RECT_W - CORNER_R, -RECT_H + CORNER_R
+        x = cx + CORNER_R * np.cos(theta)
+        y = cy + CORNER_R * np.sin(theta)
+        dx = BALL_SPEED * (-np.sin(theta))
+        dy = BALL_SPEED * (np.cos(theta))
+        return x, y, dx, dy
+    s -= arc
+
+    if s < straight_y:
+        x = RECT_W
+        y = -RECT_H + CORNER_R + s
+        dx, dy = 0.0, BALL_SPEED
+        return x, y, dx, dy
+    s -= straight_y
+
+    if s < arc:
+        theta = 0.0 + s / CORNER_R
+        cx, cy = RECT_W - CORNER_R, RECT_H - CORNER_R
+        x = cx + CORNER_R * np.cos(theta)
+        y = cy + CORNER_R * np.sin(theta)
+        dx = BALL_SPEED * (-np.sin(theta))
+        dy = BALL_SPEED * (np.cos(theta))
+        return x, y, dx, dy
+    s -= arc
+
+    if s < straight_x:
+        x = RECT_W - CORNER_R - s
+        y = RECT_H
+        dx, dy = -BALL_SPEED, 0.0
+        return x, y, dx, dy
+    s -= straight_x
+
+    if s < arc:
+        theta = 0.5 * np.pi + s / CORNER_R
+        cx, cy = -RECT_W + CORNER_R, RECT_H - CORNER_R
+        x = cx + CORNER_R * np.cos(theta)
+        y = cy + CORNER_R * np.sin(theta)
+        dx = BALL_SPEED * (-np.sin(theta))
+        dy = BALL_SPEED * (np.cos(theta))
+        return x, y, dx, dy
+    s -= arc
+
+    if s < straight_y:
+        x = -RECT_W
+        y = RECT_H - CORNER_R - s
+        dx, dy = 0.0, -BALL_SPEED
+        return x, y, dx, dy
+    s -= straight_y
+
+    theta = np.pi + s / CORNER_R
+    cx, cy = -RECT_W + CORNER_R, -RECT_H + CORNER_R
+    x = cx + CORNER_R * np.cos(theta)
+    y = cy + CORNER_R * np.sin(theta)
+    dx = BALL_SPEED * (-np.sin(theta))
+    dy = BALL_SPEED * (np.cos(theta))
+    return x, y, dx, dy
+
+
+def ball_rect_traj(t: float, t_total: float) -> Tuple[float, float]:
+    period = _rounded_rect_perimeter() / BALL_SPEED
+    s = (t % period) * BALL_SPEED
+    x, y, _, _ = _rounded_rect_pos_vel(s)
+    return x, y
+
+
+def ball_rect_vel(t: float, t_total: float) -> Tuple[float, float]:
+    period = _rounded_rect_perimeter() / BALL_SPEED
+    s = (t % period) * BALL_SPEED
+    _, _, dx, dy = _rounded_rect_pos_vel(s)
+    return dx, dy
+
+
+def compute_follow_target(
+    bx: float,
+    by: float,
+    bdx: float,
+    bdy: float,
+    follow_dist: float,
+    side: float,
+) -> Tuple[float, float, float]:
+    speed = np.hypot(bdx, bdy)
+    if speed > 1e-6:
+        ux, uy = bdx / speed, bdy / speed
+    else:
+        ux, uy = 1.0, 0.0
+    perp = np.array([-uy, ux])
+    pnorm = np.hypot(perp[0], perp[1])
+    if pnorm < 1e-6:
+        perp_unit = np.array([0.0, 1.0])
+    else:
+        perp_unit = perp / pnorm
+    rx = bx + perp_unit[0] * follow_dist * side
+    ry = by + perp_unit[1] * follow_dist * side
+    yaw_ref = np.arctan2(by - ry, bx - rx)
+    return rx, ry, yaw_ref
+
+
+class ToRwheelsimRobot(Robot):
+    def __init__(
+        self,
+        dt: float,
+        v_wheel_max: float,
+        steer_rate_max: Optional[float],
+        wheel_acc_max: Optional[float],
+        w_max: float,
+        v_max: float,
+        a_max: float,
+        ema_alpha: float = 0.2,
+        lsq_reg: float = 1e-4,
+        slip_weight_start: Optional[float] = None,
+        slip_weight_end: Optional[float] = None,
+        slip_weight_warm_steps: int = 0,
+    ):
+        self.dt = dt
+        self.v_wheel_max = v_wheel_max
+        self.steer_rate_max = STEER_RATE_MAX if steer_rate_max is None else steer_rate_max
+        self.wheel_acc_max = WHEEL_ACC_MAX if wheel_acc_max is None else wheel_acc_max
+        self.w_max = w_max
+        self.v_max = v_max
+        self.a_max = a_max
+        self.ema_alpha = ema_alpha
+        self.lsq_reg = lsq_reg
+        if slip_weight_end is None:
+            slip_weight_end = 0.2
+        if slip_weight_start is None:
+            slip_weight_start = slip_weight_end
+        self._slip_weight_start = float(slip_weight_start)
+        self._slip_weight_end = float(slip_weight_end)
+        self._slip_weight_warm_steps = int(slip_weight_warm_steps)
+        self.state_space = spaces.Box(
+            low=np.array([-np.inf, -np.inf, -np.pi], dtype=np.float32),
+            high=np.array([np.inf, np.inf, np.pi], dtype=np.float32),
+            dtype=np.float32,
+        )
+        self.action_space = spaces.Box(
+            low=np.array([-self.steer_rate_max, -self.wheel_acc_max] * 4, dtype=np.float32),
+            high=np.array([self.steer_rate_max, self.wheel_acc_max] * 4, dtype=np.float32),
+            dtype=np.float32,
+        )
+        self._steer = {name: 0.0 for name in WHEEL_ORDER}
+        self._speed = {name: 0.0 for name in WHEEL_ORDER}
+        self._prev_steer = {name: 0.0 for name in WHEEL_ORDER}
+        self._vel_world = np.zeros(2, dtype=np.float32)
+        self._w_body = 0.0
+
+    @property
+    def vel_world(self) -> np.ndarray:
+        return self._vel_world
+
+    @property
+    def w_body(self) -> float:
+        return self._w_body
+
+    def reset(self, state: np.ndarray) -> np.ndarray:
+        self._steer = {name: 0.0 for name in WHEEL_ORDER}
+        self._speed = {name: 0.0 for name in WHEEL_ORDER}
+        self._prev_steer = {name: 0.0 for name in WHEEL_ORDER}
+        self._vel_world = np.zeros(2, dtype=np.float32)
+        self._w_body = 0.0
+        self._step_count = 0
+        return super().reset(state)
+
+    def _maybe_flip(self, steer: float, speed: float, prev_steer: float) -> Tuple[float, float]:
+        steer = wrap_to_pi(steer)
+        steer = float(np.clip(steer, -STEER_LIMIT, STEER_LIMIT))
+        steer_alt = wrap_to_pi(steer + np.pi)
+
+        margin = np.deg2rad(5.0)
+        near_limit = abs(steer) > (STEER_LIMIT - margin)
+        flip_cooldown_steps = int(max(1.0, 0.3 / self.dt))
+        if not hasattr(self, "_flip_counter"):
+            self._flip_counter = 0
+        can_flip = self._flip_counter == 0
+
+        if can_flip and near_limit:
+            steer = steer_alt
+            speed = -speed
+            self._flip_counter = flip_cooldown_steps
+        elif self._flip_counter > 0:
+            self._flip_counter -= 1
+
+        steer = float(np.clip(steer, -STEER_LIMIT, STEER_LIMIT))
+        return steer, speed
+
+    def step(self, action: np.ndarray) -> np.ndarray:
+        action = clip(action, self.action_space.low, self.action_space.high)
+        px, py, yaw = self.state
+        if not hasattr(self, "_step_count"):
+            self._step_count = 0
+        self._step_count += 1
+
+        for i, name in enumerate(WHEEL_ORDER):
+            d_steer = float(action[2 * i])
+            d_speed = float(action[2 * i + 1])
+
+            steer = self._steer[name] + d_steer * self.dt
+            speed = self._speed[name] + d_speed * self.dt
+            speed = float(np.clip(speed, -self.v_wheel_max, self.v_wheel_max))
+
+            steer, speed = self._maybe_flip(steer, speed, self._prev_steer[name])
+
+            self._steer[name] = steer
+            self._speed[name] = speed
+            self._prev_steer[name] = steer
+
+        A_rows = []
+        b_rows = []
+        for name in WHEEL_ORDER:
+            x_i, y_i = WHEEL_POS[name]
+            steer = self._steer[name]
+            speed = self._speed[name]
+            c = np.cos(steer)
+            s = np.sin(steer)
+            A_rows.append([c, s, -c * y_i + s * x_i])
+            b_rows.append(speed)
+
+        A = np.array(A_rows, dtype=np.float32)
+        b = np.array(b_rows, dtype=np.float32)
+
+        vx_body, vy_body, w_body = np.linalg.lstsq(A, b, rcond=None)[0]
+        v_body_limit = 2.0 * self.v_wheel_max
+        vx_body = float(np.clip(vx_body, -v_body_limit, v_body_limit))
+        vy_body = float(np.clip(vy_body, -v_body_limit, v_body_limit))
+        w_body = float(np.clip(w_body, -self.w_max, self.w_max))
+
+        yaw_mid = yaw + 0.5 * w_body * self.dt
+        cos_yaw = np.cos(yaw_mid)
+        sin_yaw = np.sin(yaw_mid)
+        vx_world = vx_body * cos_yaw - vy_body * sin_yaw
+        vy_world = vx_body * sin_yaw + vy_body * cos_yaw
+        vel_new = np.array([vx_world, vy_world], dtype=np.float32)
+        speed = float(np.hypot(vel_new[0], vel_new[1]))
+        if speed > self.v_max and speed > 1e-9:
+            vel_new = vel_new * (self.v_max / speed)
+        delta_v = vel_new - self._vel_world
+        delta_norm = float(np.hypot(delta_v[0], delta_v[1]))
+        a_limit = self.a_max * self.dt
+        if delta_norm > a_limit and delta_norm > 1e-9:
+            delta_v = delta_v * (a_limit / delta_norm)
+        vel_new = self._vel_world + delta_v
+        self._vel_world = vel_new
+        self._w_body = w_body
+
+        px_next = px + self._vel_world[0] * self.dt
+        py_next = py + self._vel_world[1] * self.dt
+        yaw_next = wrap_to_pi(yaw + self._w_body * self.dt)
+        self.state = np.array([px_next, py_next, yaw_next], dtype=np.float32)
+        return self.state
+
+
+class BallRefContext(Context):
+    def __init__(self, dt: float, t_total: float):
+        self.dt = dt
+        self.t_total = t_total
+        self.ref_time = 0.0
+        self.state = ContextState(reference=np.zeros(4, dtype=np.float32), t=0)
+
+    def reset(self, ref_time: float = 0.0) -> ContextState[np.ndarray]:
+        self.ref_time = ref_time
+        bx, by = ball_rect_traj(self.ref_time, self.t_total)
+        bdx, bdy = ball_rect_vel(self.ref_time, self.t_total)
+        self.state = ContextState(reference=np.array([bx, by, bdx, bdy], dtype=np.float32), t=0)
+        return self.state
+
+    def step(self) -> ContextState[np.ndarray]:
+        self.ref_time += self.dt
+        bx, by = ball_rect_traj(self.ref_time, self.t_total)
+        bdx, bdy = ball_rect_vel(self.ref_time, self.t_total)
+        self.state = ContextState(reference=np.array([bx, by, bdx, bdy], dtype=np.float32), t=0)
+        return self.state
+
+    def get_zero_state(self) -> ContextState[np.ndarray]:
+        return ContextState(reference=np.zeros(4, dtype=np.float32), t=0)
+
+
+class ToRwheelsimEnv(Env):
+    termination_penalty = 50.0
+    metadata = {
+        "render.modes": ["human", "rgb_array"],
+    }
+
+    def __init__(
+        self,
+        *,
+        dt: float = 0.05,
+        t_total: float = 30.0,
+        episode_steps: int = 1500,
+        follow_dist: float = 0.3,
+        preview_time: float = 0.1,
+        v_wheel_max: float = 0.3,
+        w_max: float = 1.5,
+        v_max: float = 0.3,
+        a_max: float = 0.3,
+        steer_rate_max: Optional[float] = None,
+        wheel_acc_max: Optional[float] = None,
+        slip_weight: float = 0.2,
+        slip_weight_start: Optional[float] = None,
+        slip_weight_end: Optional[float] = None,
+        slip_weight_warm_steps: int = 0,
+        debug_stats: bool = False,
+        debug_interval: int = 100,
+        w_slip_start: float = 0.0,
+        w_slip_end: float = 0.3,
+        w_slip_warm_steps: int = 50000,
+        w_slip_max: float = 0.5,
+        **kwargs,
+    ):
+        self.robot = ToRwheelsimRobot(
+            dt=dt,
+            v_wheel_max=v_wheel_max,
+            steer_rate_max=steer_rate_max,
+            wheel_acc_max=wheel_acc_max,
+            w_max=w_max,
+            v_max=v_max,
+            a_max=a_max,
+            slip_weight_start=slip_weight_start if slip_weight_start is not None else slip_weight,
+            slip_weight_end=slip_weight_end if slip_weight_end is not None else slip_weight,
+            slip_weight_warm_steps=slip_weight_warm_steps,
+        )
+        self.context = BallRefContext(dt=dt, t_total=t_total)
+        self.dt = dt
+        self.t_total = t_total
+        self.follow_dist = follow_dist
+        self.preview_time = float(preview_time)
+        self.max_episode_steps = int(episode_steps)
+        self.v_max = v_max
+        self.w_max = w_max
+        self.w_max = w_max
+
+        self.state_dim = 3
+        obs_dim = 19
+        self.observation_space = spaces.Box(
+            low=np.array([-np.inf] * obs_dim, dtype=np.float32),
+            high=np.array([np.inf] * obs_dim, dtype=np.float32),
+            dtype=np.float32,
+        )
+        self.action_space = self.robot.action_space
+        self.side = -1.0
+
+        self.init_dist = 1.0
+        self._yaw_ref_prev = 0.0
+        self._prev_dist_ref = 0.0
+        self._last_ref_time = None
+        self._last_reward_time = None
+        self._yaw_err_ema = 0.0
+        self._yaw_err_ema_alpha = 0.95
+        self._prev_w_body = 0.0
+        self._debug_stats = debug_stats
+        self._debug_interval = int(debug_interval)
+        self._debug_step = 0
+        self._w_slip_start = float(w_slip_start)
+        self._w_slip_end = float(w_slip_end)
+        self._w_slip_warm_steps = int(w_slip_warm_steps)
+        self._w_slip_max = float(w_slip_max)
+        self.seed()
+
+    def reset(
+        self,
+        seed: Optional[int] = None,
+        options: Optional[dict] = None,
+        init_state: Optional[Sequence[float]] = None,
+        ref_time: Optional[float] = None,
+    ) -> Tuple[np.ndarray, dict]:
+        if seed is not None:
+            self.seed(seed)
+
+        if ref_time is None:
+            period = _rounded_rect_perimeter() / BALL_SPEED
+            ref_time = period * self.np_random.uniform(0.0, 1.0)
+        context_state = self.context.reset(ref_time=ref_time)
+
+        bx, by, bdx, bdy = context_state.reference
+        if init_state is None:
+            base_angle = -3.0 * np.pi / 4.0
+            angle = base_angle + self.np_random.uniform(-0.2, 0.2)
+            px0 = bx + self.init_dist * np.cos(angle)
+            py0 = by + self.init_dist * np.sin(angle)
+            yaw0 = np.arctan2(by - py0, bx - px0)
+            init_state = [px0, py0, yaw0]
+        else:
+            init_state = np.array(init_state, dtype=np.float32)
+
+        self._state = State(
+            robot_state=self.robot.reset(np.array(init_state, dtype=np.float32)),
+            context_state=context_state,
+        )
+        rx, ry, yaw_ref = compute_follow_target(bx, by, bdx, bdy, self.follow_dist, self.side)
+        self._yaw_ref_prev = yaw_ref
+        self._prev_dist_ref = float(np.hypot(init_state[0] - rx, init_state[1] - ry))
+        self._last_ref_time = self.context.ref_time
+        self._last_reward_time = None
+        self._yaw_err_ema = 0.0
+        self._prev_w_body = 0.0
+        self._debug_step = 0
+        return self._get_obs(), self._get_info()
+
+    def _get_obs(self) -> np.ndarray:
+        px, py, yaw = self.robot.state
+        vx, vy = self.robot.vel_world
+        bx, by, bdx, bdy = self.context.state.reference
+        rx, ry, yaw_ref = self._get_ref_target()
+        rel_ref = np.array([px - rx, py - ry], dtype=np.float32)
+        rel_ball = np.array([px - bx, py - by], dtype=np.float32)
+        vel_err = np.array([vx - bdx, vy - bdy], dtype=np.float32)
+        yaw_err = np.array([wrap_to_pi(yaw - yaw_ref)], dtype=np.float32)
+        wheel_features = []
+        for name in WHEEL_ORDER:
+            steer = self.robot._steer[name]
+            speed = self.robot._speed[name]
+            wheel_features.extend(
+                [np.cos(steer), np.sin(steer), speed / max(self.robot.v_wheel_max, 1e-6)]
+            )
+        wheel_features = np.array(wheel_features, dtype=np.float32)
+        return np.concatenate((rel_ref, rel_ball, vel_err, yaw_err, wheel_features), axis=0)
+
+    def _get_reward(self, action: np.ndarray) -> float:
+        px, py, yaw = self.robot.state
+        vx, vy = self.robot.vel_world
+        omega = self.robot.w_body
+        _, _, bdx, bdy = self.context.state.reference
+        x_ref, y_ref, yaw_ref = self._get_ref_target()
+        vx_ref, vy_ref, omega_ref = bdx, bdy, 0.0
+        pos_err = float(np.hypot(px - x_ref, py - y_ref) / max(self.follow_dist, 1e-6))
+        yaw_err = abs(wrap_to_pi(yaw - yaw_ref)) / np.pi
+        vel_err = float(np.hypot(vx - vx_ref, vy - vy_ref) / max(self.v_max, 1e-6))
+        omega_err = abs(omega - omega_ref) / max(self.w_max, 1e-6)
+        action = clip(action, self.action_space.low, self.action_space.high)
+        ctrl_cost = 0.0
+        for i in range(4):
+            d_steer = action[2 * i] / max(self.robot.steer_rate_max, 1e-6)
+            d_speed = action[2 * i + 1] / max(self.robot.wheel_acc_max, 1e-6)
+            ctrl_cost += float(d_steer**2 + d_speed**2)
+
+        wheel_vecs = []
+        for name in WHEEL_ORDER:
+            steer = self.robot._steer[name]
+            speed = self.robot._speed[name] / max(self.robot.v_wheel_max, 1e-6)
+            wheel_vecs.append(speed * np.array([np.cos(steer), np.sin(steer)], dtype=np.float32))
+        wheel_vecs = np.array(wheel_vecs, dtype=np.float32)
+        v_mean = np.mean(wheel_vecs, axis=0)
+        dir_penalty = float(np.sum(np.linalg.norm(wheel_vecs - v_mean, axis=1) ** 2))
+        waste_penalty = float(
+            np.sum(np.linalg.norm(wheel_vecs, axis=1) ** 2) - 4.0 * np.linalg.norm(v_mean) ** 2
+        )
+
+        cos_yaw = np.cos(yaw)
+        sin_yaw = np.sin(yaw)
+        v_body_x = vx * cos_yaw + vy * sin_yaw
+        v_body_y = -vx * sin_yaw + vy * cos_yaw
+        slip_penalty = 0.0
+        slip_sq_list = []
+        for name in WHEEL_ORDER:
+            x_i, y_i = WHEEL_POS[name]
+            steer = self.robot._steer[name]
+            wheel_vx = v_body_x - self.robot.w_body * y_i
+            wheel_vy = v_body_y + self.robot.w_body * x_i
+            slip = (-np.sin(steer) * wheel_vx + np.cos(steer) * wheel_vy)
+            slip_norm = slip / max(self.robot.v_wheel_max, 1e-6)
+            slip_sq = float(slip_norm ** 2)
+            slip_penalty += slip_sq
+            slip_sq_list.append(slip_sq)
+
+        w_pos = 6.0
+        w_vel = 1.0
+        w_yaw = 2.0
+        w_omega = 0.5
+        w_ctrl = 0.01
+        w_dir = 0.2
+        w_waste = 0.1
+        if self._w_slip_warm_steps <= 0:
+            w_slip = self._w_slip_end
+        else:
+            frac = min(1.0, self._debug_step / self._w_slip_warm_steps)
+            w_slip = self._w_slip_start + (self._w_slip_end - self._w_slip_start) * frac
+        yaw_rate = float(self.robot.w_body)
+        yaw_accel = (yaw_rate - self._prev_w_body) / max(self.dt, 1e-6)
+        self._prev_w_body = yaw_rate
+        w_yaw_accel = 0.01
+        max_slip_penalty = max(slip_sq_list) if slip_sq_list else 0.0
+        reward = (
+            -w_pos * pos_err
+            -w_vel * vel_err
+            -w_yaw * yaw_err
+            -w_omega * (omega_err ** 2)
+            -w_yaw_accel * (yaw_accel ** 2)
+            -w_ctrl * ctrl_cost
+            -w_dir * dir_penalty
+            -w_waste * waste_penalty
+            -w_slip * slip_penalty
+            -self._w_slip_max * max_slip_penalty
+        )
+        if self._debug_stats:
+            self._debug_step += 1
+            if self._debug_step % max(self._debug_interval, 1) == 0:
+                mean_action = float(np.mean(np.abs(action)))
+                mean_speed = float(
+                    np.mean([abs(self.robot._speed[n]) for n in WHEEL_ORDER])
+                )
+                v_norm = float(np.hypot(vx, vy))
+                print(
+                    f"[debug] step={self._debug_step} "
+                    f"mean|action|={mean_action:.4f} mean|wheel_speed|={mean_speed:.4f} "
+                    f"|v|={v_norm:.4f}"
+                )
+        return reward
+
+    def _get_ref_target(self) -> Tuple[float, float, float]:
+        bx, by, bdx, bdy = self.context.state.reference
+        if self.preview_time > 0.0:
+            bx = bx + bdx * self.preview_time
+            by = by + bdy * self.preview_time
+        rx, ry, yaw_ref_raw = compute_follow_target(bx, by, bdx, bdy, self.follow_dist, self.side)
+        if self._last_ref_time != self.context.ref_time:
+            beta = 0.1
+            dyaw = wrap_to_pi(yaw_ref_raw - self._yaw_ref_prev)
+            self._yaw_ref_prev = wrap_to_pi(self._yaw_ref_prev + beta * dyaw)
+            self._last_ref_time = self.context.ref_time
+        return rx, ry, self._yaw_ref_prev
+
+    def _get_terminated(self) -> bool:
+        px, py = self.robot.state[:2]
+        bx, by = self.context.state.reference[:2]
+        dist_to_ball = np.hypot(px - bx, py - by)
+        return dist_to_ball > 5.0
+
+    def render(self, mode="human"):
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as pc
+
+        plt.ion()
+        fig = plt.figure(num=0, figsize=(6.4, 6.4))
+        plt.clf()
+        px, py, yaw = self.robot.state
+        bx, by, bdx, bdy = self.context.state.reference
+        rx, ry, _ = compute_follow_target(bx, by, bdx, bdy, self.follow_dist, self.side)
+
+        ax = plt.axes(xlim=(px - 4, px + 4), ylim=(py - 4, py + 4))
+        ax.set_aspect("equal")
+
+        veh_length = 0.48
+        veh_width = 0.35
+        x_offset = veh_length / 2.0 * np.cos(yaw) - veh_width / 2.0 * np.sin(yaw)
+        y_offset = veh_length / 2.0 * np.sin(yaw) + veh_width / 2.0 * np.cos(yaw)
+        ax.add_patch(pc.Rectangle(
+            (px - x_offset, py - y_offset),
+            veh_length,
+            veh_width,
+            angle=np.rad2deg(yaw),
+            facecolor="w",
+            edgecolor="r",
+            zorder=2,
+        ))
+        wheel_len = 0.08
+        wheel_rad = 0.025
+        for name in WHEEL_ORDER:
+            x_i, y_i = WHEEL_POS[name]
+            steer = self.robot._steer[name]
+            wx = px + np.cos(yaw) * x_i - np.sin(yaw) * y_i
+            wy = py + np.sin(yaw) * x_i + np.cos(yaw) * y_i
+            theta = yaw + steer
+            dx = 0.5 * wheel_len * np.cos(theta)
+            dy = 0.5 * wheel_len * np.sin(theta)
+            ax.add_patch(pc.Circle((wx, wy), radius=wheel_rad, color="k", zorder=4))
+            ax.plot([wx - dx, wx + dx], [wy - dy, wy + dy], color="k", linewidth=2, zorder=5)
+        ax.add_patch(pc.Circle((bx, by), radius=0.05, color="red", zorder=3))
+        ax.plot([rx], [ry], marker="x", color="blue", zorder=3)
+
+        ax.set_title("Swerve Tracking (RL Env)")
+        ax.grid(True)
+        plt.tight_layout()
+
+        if mode == "rgb_array":
+            fig.canvas.draw()
+            image_from_plot = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+            image_from_plot = image_from_plot.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+            plt.pause(0.01)
+            return image_from_plot
+        if mode == "human":
+            plt.pause(0.01)
+            plt.show(block=False)
+
+
+def env_creator(**kwargs):
+    return ToRwheelsimEnv(**kwargs)
+
+
+# Training curriculum:
+# 1. straight line
+# 2. circular path
+# 3. rounded rectangle
