@@ -30,3 +30,5 @@ events.out.*
 
 # 其他
 *.zip
+gops.egg-info/
+*.pyd
