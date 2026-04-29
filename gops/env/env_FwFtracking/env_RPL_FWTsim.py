@@ -30,6 +30,20 @@ def clip(x: np.ndarray, low: np.ndarray, high: np.ndarray) -> np.ndarray:
     return np.minimum(np.maximum(x, low), high)
 
 
+def _circular_mean(angles: np.ndarray) -> float:
+    return float(np.arctan2(np.mean(np.sin(angles)), np.mean(np.cos(angles))))
+
+
+def _angle_rms_to(angles: np.ndarray, target: float) -> float:
+    err = wrap_to_pi(angles - target)
+    return float(np.sqrt(np.mean(err**2)))
+
+
+def _soft_gauss(err: float, scale: float) -> float:
+    x = float(err) / max(float(scale), 1e-6)
+    return float(np.exp(-0.5 * min(x * x, 60.0)))
+
+
 def _rounded_rect_perimeter() -> float:
     straight_x = 2.0 * (RECT_W - CORNER_R)
     straight_y = 2.0 * (RECT_H - CORNER_R)
@@ -123,6 +137,72 @@ def ball_rect_vel(t: float, t_total: float) -> Tuple[float, float]:
     return dx, dy
 
 
+def _line_pos_vel(
+    t: float,
+    direction: Tuple[float, float],
+    start: Tuple[float, float],
+    speed: float = BALL_SPEED,
+) -> Tuple[float, float, float, float]:
+    dx, dy = direction
+    norm = float(np.hypot(dx, dy))
+    if norm < 1e-6:
+        ux, uy = 1.0, 0.0
+    else:
+        ux, uy = dx / norm, dy / norm
+    return (
+        float(start[0] + speed * t * ux),
+        float(start[1] + speed * t * uy),
+        float(speed * ux),
+        float(speed * uy),
+    )
+
+
+def _circle_pos_vel(t: float, radius: float = 1.2, speed: float = BALL_SPEED) -> Tuple[float, float, float, float]:
+    omega = speed / max(radius, 1e-6)
+    theta = omega * t
+    return (
+        float(radius * np.cos(theta)),
+        float(radius * np.sin(theta)),
+        float(-radius * omega * np.sin(theta)),
+        float(radius * omega * np.cos(theta)),
+    )
+
+
+def _s_curve_pos_vel(t: float, speed: float = BALL_SPEED) -> Tuple[float, float, float, float]:
+    x_start = -1.8
+    amp = 0.55
+    wavelength = 2.4
+    k = 2.0 * np.pi / wavelength
+    x = x_start + speed * t
+    phase = k * (x - x_start)
+    y = amp * np.sin(phase)
+    dx = speed
+    dy = amp * k * np.cos(phase) * dx
+    return float(x), float(y), float(dx), float(dy)
+
+
+def get_ref_state_by_type(t: float, t_total: float, traj_type: str = "rounded_rect") -> Tuple[float, float, float, float]:
+    traj = str(traj_type or "rounded_rect").lower()
+    if traj in {"rounded_rect", "round_rect", "rect", "default"}:
+        bx, by = ball_rect_traj(t, t_total)
+        bdx, bdy = ball_rect_vel(t, t_total)
+        return bx, by, bdx, bdy
+    if traj in {"line_forward", "line_x", "straight", "straight_x"}:
+        return _line_pos_vel(t, direction=(1.0, 0.0), start=(-1.8, 0.0))
+    if traj in {"line_lateral", "line_y", "lateral", "straight_y"}:
+        return _line_pos_vel(t, direction=(0.0, 1.0), start=(0.0, -1.8))
+    if traj in {"line_diagonal", "diag", "diagonal"}:
+        return _line_pos_vel(t, direction=(1.0, 1.0), start=(-1.3, -1.3))
+    if traj in {"circle", "circular"}:
+        return _circle_pos_vel(t)
+    if traj in {"s_curve", "sine", "s"}:
+        return _s_curve_pos_vel(t)
+    raise ValueError(
+        "traj_type must be one of rounded_rect, line_forward, line_lateral, "
+        "line_diagonal, circle, s_curve."
+    )
+
+
 def compute_scan_follow_target(
     bx: float,
     by: float,
@@ -157,6 +237,11 @@ def huber_loss(x: float, delta: float = 0.25) -> float:
     if ax <= delta:
         return 0.5 * ax * ax
     return delta * (ax - 0.5 * delta)
+
+
+def smoothstep(x: float, lo: float, hi: float) -> float:
+    z = float(np.clip((x - lo) / max(hi - lo, 1e-6), 0.0, 1.0))
+    return z * z * (3.0 - 2.0 * z)
 
 
 class ToRwheelsimRobot(Robot):
@@ -318,23 +403,37 @@ class ToRwheelsimRobot(Robot):
 
 
 class BallRefContext(Context):
-    def __init__(self, dt: float, t_total: float):
+    def __init__(self, dt: float, t_total: float, traj_type: str = "rounded_rect"):
         self.dt = dt
         self.t_total = t_total
+        self.traj_type = str(traj_type or "rounded_rect")
         self.ref_time = 0.0
         self.state = ContextState(reference=np.zeros(4, dtype=np.float32), t=0)
 
-    def reset(self, ref_time: float = 0.0) -> ContextState[np.ndarray]:
+    def reference_at(self, ref_time: float) -> Tuple[float, float, float, float]:
+        return get_ref_state_by_type(ref_time, self.t_total, self.traj_type)
+
+    def sample_ref_time(self, np_random) -> float:
+        traj = self.traj_type.lower()
+        if traj in {"rounded_rect", "round_rect", "rect", "default"}:
+            period = _rounded_rect_perimeter() / BALL_SPEED
+            return float(period * np_random.uniform(0.0, 1.0))
+        if traj in {"circle", "circular"}:
+            period = 2.0 * np.pi * 1.2 / BALL_SPEED
+            return float(period * np_random.uniform(0.0, 1.0))
+        return 0.0
+
+    def reset(self, ref_time: float = 0.0, traj_type: Optional[str] = None) -> ContextState[np.ndarray]:
+        if traj_type is not None:
+            self.traj_type = str(traj_type)
         self.ref_time = ref_time
-        bx, by = ball_rect_traj(self.ref_time, self.t_total)
-        bdx, bdy = ball_rect_vel(self.ref_time, self.t_total)
+        bx, by, bdx, bdy = self.reference_at(self.ref_time)
         self.state = ContextState(reference=np.array([bx, by, bdx, bdy], dtype=np.float32), t=0)
         return self.state
 
     def step(self) -> ContextState[np.ndarray]:
         self.ref_time += self.dt
-        bx, by = ball_rect_traj(self.ref_time, self.t_total)
-        bdx, bdy = ball_rect_vel(self.ref_time, self.t_total)
+        bx, by, bdx, bdy = self.reference_at(self.ref_time)
         self.state = ContextState(reference=np.array([bx, by, bdx, bdy], dtype=np.float32), t=0)
         return self.state
 
@@ -361,6 +460,7 @@ class ToRwheelsimSeqScanEnv(Env):
         wheel_acc_max: Optional[float] = None,
         action_horizon: int = 3,
         safety_margin_ratio: float = 0.12,
+        traj_type: str = "rounded_rect",
         **kwargs,
     ):
         self.robot = ToRwheelsimRobot(
@@ -372,7 +472,8 @@ class ToRwheelsimSeqScanEnv(Env):
             v_max=v_max,
             a_max=a_max,
         )
-        self.context = BallRefContext(dt=dt, t_total=t_total)
+        self.context = BallRefContext(dt=dt, t_total=t_total, traj_type=traj_type)
+        self.traj_type = str(traj_type or "rounded_rect")
         self.dt = dt
         self.t_total = t_total
         self.follow_dist = follow_dist
@@ -498,8 +599,7 @@ class ToRwheelsimSeqScanEnv(Env):
         preview = []
         for k in range(1, steps + 1):
             t_k = self.context.ref_time + k * self.dt
-            bx_k, by_k = ball_rect_traj(t_k, self.t_total)
-            bdx_k, bdy_k = ball_rect_vel(t_k, self.t_total)
+            bx_k, by_k, bdx_k, bdy_k = self.context.reference_at(t_k)
             rx_k, ry_k = compute_scan_follow_target(bx_k, by_k, bdx_k, bdy_k, self.follow_dist)
             xr_k, yr_k = world_to_body(px, py, yaw, rx_k, ry_k)
             preview.extend([xr_k, yr_k])
@@ -590,24 +690,74 @@ class ToRwheelsimSeqScanEnv(Env):
         )
         return obs
 
-    def _mode_proto_1(self, tangent_body: np.ndarray, steer_vecs: np.ndarray, speeds: np.ndarray) -> float:
-        # Mode-1: four wheels aligned and speed-consistent, suitable for straight segments.
+    def _mode_proto_1(self, tangent_body: np.ndarray, steer_angles: np.ndarray, speeds: np.ndarray) -> float:
+        # Mode-1: all wheels should collapse to the same tangent-aligned steering basin.
         tan = tangent_body / (np.linalg.norm(tangent_body) + 1e-6)
-        align = float(np.mean(steer_vecs @ tan))
-        steer_consistency = float(np.mean(steer_vecs @ np.mean(steer_vecs, axis=0)))
-        speed_consistency = float(np.mean((speeds - np.mean(speeds)) ** 2))
-        return 0.9 * align + 1.5 * steer_consistency - 1.8 * speed_consistency
+        target_angle = float(np.arctan2(tan[1], tan[0]))
+        mean_angle = _circular_mean(steer_angles)
+        target_rms = _angle_rms_to(steer_angles, target_angle)
+        spread_rms = _angle_rms_to(steer_angles, mean_angle)
+        speed_rms = float(np.sqrt(np.mean((speeds - np.mean(speeds)) ** 2)))
 
-    def _mode_proto_2(self, steer_angles: np.ndarray, speeds: np.ndarray) -> float:
-        # Mode-2: wheel(1,2) coherent, wheel(3,4) coherent, and two groups opposite.
-        g12 = wrap_to_pi(0.5 * (steer_angles[0] + steer_angles[1]))
-        g34 = wrap_to_pi(0.5 * (steer_angles[2] + steer_angles[3]))
-        c12 = np.cos(steer_angles[0] - steer_angles[1])
-        c34 = np.cos(steer_angles[2] - steer_angles[3])
-        opposite = -np.cos(wrap_to_pi(g12 - g34))
-        sp12 = (speeds[0] - speeds[1]) ** 2
-        sp34 = (speeds[2] - speeds[3]) ** 2
-        return float(1.0 * c12 + 1.0 * c34 + 1.4 * opposite - 0.7 * (sp12 + sp34))
+        target_score = _soft_gauss(target_rms, np.deg2rad(10.0))
+        spread_score = _soft_gauss(spread_rms, np.deg2rad(5.5))
+        speed_score = _soft_gauss(speed_rms, 0.08)
+        peak = (target_score ** 0.55) * (spread_score ** 0.30) * (speed_score ** 0.15)
+        miss = (
+            0.55 * (1.0 - target_score)
+            + 0.75 * (1.0 - spread_score)
+            + 0.35 * (1.0 - speed_score)
+        )
+        return float(3.0 * peak - miss)
+
+    def _mode_proto_2(
+        self,
+        tangent_body: np.ndarray,
+        steer_angles: np.ndarray,
+        speeds: np.ndarray,
+        mode2_focus: float,
+    ) -> float:
+        # Mode-2: each side must be coherent, with opposite deviations around
+        # the tangent-aligned Mode-1 steering direction.
+        tan = tangent_body / (np.linalg.norm(tangent_body) + 1e-6)
+        base_angle = float(np.arctan2(tan[1], tan[0]))
+        g12 = _circular_mean(steer_angles[[0, 1]])
+        g34 = _circular_mean(steer_angles[[2, 3]])
+
+        group12_rms = _angle_rms_to(steer_angles[[0, 1]], g12)
+        group34_rms = _angle_rms_to(steer_angles[[2, 3]], g34)
+        internal_rms = 0.5 * (group12_rms + group34_rms)
+
+        d12 = float(wrap_to_pi(g12 - base_angle))
+        d34 = float(wrap_to_pi(g34 - base_angle))
+        symmetry_err = abs(float(wrap_to_pi(d12 + d34)))
+        half_sep = 0.5 * abs(float(wrap_to_pi(d12 - d34)))
+        desired_sep = np.deg2rad(18.0 + 14.0 * float(np.clip(mode2_focus, 0.0, 1.0)))
+
+        sp12 = float(abs(speeds[0] - speeds[1]))
+        sp34 = float(abs(speeds[2] - speeds[3]))
+        group_speed_rms = float(np.sqrt(0.5 * (sp12**2 + sp34**2)))
+
+        internal_score = _soft_gauss(internal_rms, np.deg2rad(5.5))
+        symmetry_score = _soft_gauss(symmetry_err, np.deg2rad(10.0))
+        sep_center_score = _soft_gauss(abs(half_sep - desired_sep), np.deg2rad(12.0))
+        sep_nonzero_score = smoothstep(half_sep, np.deg2rad(8.0), np.deg2rad(18.0))
+        speed_score = _soft_gauss(group_speed_rms, 0.09)
+        sep_score = float(sep_center_score * sep_nonzero_score)
+
+        peak = (
+            internal_score ** 0.35
+            * symmetry_score ** 0.30
+            * sep_score ** 0.25
+            * speed_score ** 0.10
+        )
+        miss = (
+            0.75 * (1.0 - internal_score)
+            + 0.55 * (1.0 - symmetry_score)
+            + 0.50 * (1.0 - sep_score)
+            + 0.30 * (1.0 - speed_score)
+        )
+        return float(3.2 * peak - miss)
 
     def _mode_proto_3(self, steer_angles: np.ndarray, speeds: np.ndarray) -> float:
         # Placeholder extensible prototype.
@@ -618,29 +768,27 @@ class ToRwheelsimSeqScanEnv(Env):
         return float(0.0 - 0.05 * np.var(steer_angles))
 
     def _mode_gating(self) -> Tuple[float, float, float, float, np.ndarray]:
-        # Dynamic gating by local future-reference heading change.
-        p = self._future_ref_preview_body(steps=3).reshape(3, 2)
-        d1 = p[1] - p[0]
-        d2 = p[2] - p[1]
-        n1 = np.linalg.norm(d1)
-        n2 = np.linalg.norm(d2)
-        if n1 < 1e-6:
-            d1 = np.array([1.0, 0.0], dtype=np.float32)
-            n1 = 1.0
-        if n2 < 1e-6:
-            d2 = np.array([1.0, 0.0], dtype=np.float32)
-            n2 = 1.0
-        d1n = d1 / n1
-        d2n = d2 / n2
-        turn = np.arccos(np.clip(np.dot(d1n, d2n), -1.0, 1.0))
-        k = float(np.clip(turn / np.deg2rad(60.0), 0.0, 1.0))
+        # Use a longer heading preview so rounded-corner turns activate Mode-2
+        # before the robot is already inside the corner.
+        t0 = float(self.context.ref_time)
+        lookahead_time = 1.2
+        _, _, vx0, vy0 = self.context.reference_at(t0)
+        _, _, vx1, vy1 = self.context.reference_at(t0 + lookahead_time)
+        heading0 = float(np.arctan2(vy0, vx0))
+        heading1 = float(np.arctan2(vy1, vx1))
+        turn = abs(wrap_to_pi(heading1 - heading0))
+        k = smoothstep(turn, np.deg2rad(2.5), np.deg2rad(13.0))
+        k = float(k * k / (k * k + (1.0 - k) * (1.0 - k) + 1e-9))
         alpha1 = 1.0 - k
         alpha2 = k
         alpha3 = 0.1 * (1.0 - k)
         alpha4 = 0.1 * k
         z = alpha1 + alpha2 + alpha3 + alpha4 + 1e-9
         alpha1, alpha2, alpha3, alpha4 = alpha1 / z, alpha2 / z, alpha3 / z, alpha4 / z
-        tangent = d1n.astype(np.float32)
+        c = np.cos(self.robot.state[2])
+        s = np.sin(self.robot.state[2])
+        tangent = np.array([c * vx0 + s * vy0, -s * vx0 + c * vy0], dtype=np.float32)
+        tangent = tangent / (np.linalg.norm(tangent) + 1e-6)
         return float(alpha1), float(alpha2), float(alpha3), float(alpha4), tangent
 
     def _compute_reward(
@@ -678,14 +826,19 @@ class ToRwheelsimSeqScanEnv(Env):
 
         steer_angles = np.array([self.robot._steer[n] for n in WHEEL_ORDER], dtype=np.float32)
         speeds = np.array([self.robot._speed[n] / max(self.robot.v_wheel_max, 1e-6) for n in WHEEL_ORDER], dtype=np.float32)
-        steer_vecs = np.stack([np.cos(steer_angles), np.sin(steer_angles)], axis=1)
         a1, a2, a3, a4, tangent = self._mode_gating()
         mode_norm = max(a1 + a2, 1e-6)
         a1 = a1 / mode_norm
         a2 = a2 / mode_norm
-        m1 = self._mode_proto_1(tangent, steer_vecs, speeds)
-        m2 = self._mode_proto_2(steer_angles, speeds)
+        m1 = self._mode_proto_1(tangent, steer_angles, speeds)
+        m2 = self._mode_proto_2(tangent, steer_angles, speeds, a2)
         mode_raw = float(a1 * m1 + a2 * m2)
+        mode1_focus = smoothstep(a1, 0.80, 0.95)
+        mode1_speed_var = float(np.mean((speeds - np.mean(speeds)) ** 2))
+        mode1_mean_angle = _circular_mean(steer_angles)
+        mode1_steer_spread = float(
+            np.mean(wrap_to_pi(steer_angles - mode1_mean_angle) ** 2)
+        )
         self._last_mode_alpha_1 = a1
         self._last_mode_alpha_2 = a2
 
@@ -742,6 +895,10 @@ class ToRwheelsimSeqScanEnv(Env):
             -0.05 * reverse_penalty
             -0.12 * side_penalty
         )
+        straight_speed_pen = float(mode1_focus * mode1_speed_var)
+        straight_steer_pen = float(
+            mode1_focus * mode1_steer_spread / max(np.deg2rad(20.0) ** 2, 1e-6)
+        )
 
         act_norm = np.array([
             self.robot.steer_rate_max,
@@ -769,7 +926,17 @@ class ToRwheelsimSeqScanEnv(Env):
         yaw_acc = (w_body - self._prev_w_body) / max(self.dt, 1e-6)
         yaw_smooth_pen = float((w_body / max(self.w_max, 1e-6)) ** 2 + 0.2 * yaw_acc**2)
 
-        r_smooth = -0.012 * mag_pen - 0.015 * delta_pen - 0.008 * seq_pen - 0.004 * yaw_smooth_pen
+        r_safe += (
+            -0.10 * straight_speed_pen
+            -0.08 * straight_steer_pen
+        )
+
+        r_smooth = (
+            -0.012 * mag_pen
+            -0.015 * delta_pen
+            -0.008 * seq_pen
+            -0.004 * yaw_smooth_pen
+        )
 
         total = r_task + r_mode + r_safe + r_smooth
         terms = {
@@ -782,9 +949,16 @@ class ToRwheelsimSeqScanEnv(Env):
             "reward_safe": float(r_safe),
             "reward_smooth": float(r_smooth),
             "mode_raw": float(mode_raw),
+            "mode_proto_1": float(m1),
+            "mode_proto_2": float(m2),
             "mode_task_gate": float(task_gate),
             "mode_safety_gate": float(safety_gate),
             "mode_motion_penalty": float(mode_motion_penalty),
+            "mode1_focus": float(mode1_focus),
+            "straight_speed_pen": float(straight_speed_pen),
+            "straight_steer_pen": float(straight_steer_pen),
+            "straight_speed_var": float(mode1_speed_var),
+            "straight_steer_spread": float(mode1_steer_spread),
             "flip_count": float(self.robot.last_flip_count),
             "min_margin": float(margin_min),
             "ref_pos_error": float(pos_err),
@@ -818,10 +992,13 @@ class ToRwheelsimSeqScanEnv(Env):
         if seed is not None:
             self.seed(seed)
 
-        if ref_time is None:
-            period = _rounded_rect_perimeter() / BALL_SPEED
-            ref_time = period * self.np_random.uniform(0.0, 1.0)
+        if options is not None and options.get("traj_type") is not None:
+            self.context.traj_type = str(options["traj_type"])
 
+        if ref_time is None:
+            ref_time = self.context.sample_ref_time(self.np_random)
+
+        self.traj_type = self.context.traj_type
         context_state = self.context.reset(ref_time=ref_time)
         bx, by, bdx, bdy = context_state.reference
         speed = float(np.hypot(bdx, bdy))

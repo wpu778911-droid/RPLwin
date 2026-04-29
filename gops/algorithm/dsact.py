@@ -245,6 +245,7 @@ class DSACT(AlgorithmBase):
             data["obs2"],
             data["done"],
         )
+        discount_steps = data.get("next_discount_steps", torch.ones_like(done))
         logits_2 = self.networks.policy_target(obs2)
         act2_dist = self.networks.create_action_distributions(logits_2)
         act2, log_prob_act2 = act2_dist.rsample()
@@ -275,6 +276,7 @@ class DSACT(AlgorithmBase):
         target_q1, target_q1_bound = self._compute_target_q(
             rew,
             done,
+            discount_steps,
             q1.detach(),
             self.mean_std1.detach(),
             q_next.detach(),
@@ -285,6 +287,7 @@ class DSACT(AlgorithmBase):
         target_q2, target_q2_bound = self._compute_target_q(
             rew,
             done,
+            discount_steps,
             q2.detach(),
             self.mean_std2.detach(),
             q_next.detach(),
@@ -308,11 +311,12 @@ class DSACT(AlgorithmBase):
 
         return q1_loss +q2_loss, q1.detach().mean(), q2.detach().mean(), q1_std.detach().mean(), q2_std.detach().mean(), q1_std.min().detach(), q2_std.min().detach()
 
-    def _compute_target_q(self, r, done, q,q_std, q_next, q_next_sample, log_prob_a_next):
-        target_q = r + (1 - done) * self.gamma * (
+    def _compute_target_q(self, r, done, discount_steps, q, q_std, q_next, q_next_sample, log_prob_a_next):
+        discount = torch.pow(torch.full_like(done, self.gamma), discount_steps)
+        target_q = r + (1 - done) * discount * (
             q_next - self._get_alpha() * log_prob_a_next
         )
-        target_q_sample = r + (1 - done) * self.gamma * (
+        target_q_sample = r + (1 - done) * discount * (
             q_next_sample - self._get_alpha() * log_prob_a_next
         )
         td_bound = 3 * q_std
