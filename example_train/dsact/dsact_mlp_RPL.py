@@ -155,12 +155,31 @@ if __name__ == "__main__":
         env_id = args.get("env_id", "")
         env_map = {
             "env_RPL_FWTsim001": "gops/env/env_FwFtracking/env_RPL_FWTsim.py",
+            "env_RPL_FWTsim001_mode1yaw": [
+                "gops/env/env_FwFtracking/env_RPL_FWTsim001_mode1yaw.py",
+                "gops/env/env_FwFtracking/env_RPL_FWTsim.py",
+            ],
+            "env_RPL_FWTsim001_actorchunk_mode1yaw": [
+                "gops/env/env_FwFtracking/env_RPL_FWTsim001_actorchunk_mode1yaw.py",
+                "gops/env/env_FwFtracking/env_RPL_FWTsim.py",
+            ],
+            "env_RPL_FWTsim001_actorchunk_te_mode1yaw": [
+                "gops/env/env_FwFtracking/env_RPL_FWTsim001_actorchunk_te_mode1yaw.py",
+                "gops/env/env_FwFtracking/env_RPL_FWTsim.py",
+            ],
+            "env_RPL_FWTsim_chunk": "gops/env/env_FwFtracking/env_RPL_FWTsim_chunk.py",
+            "env_RPL_FWTsim_chunk001": "gops/env/env_FwFtracking/env_RPL_FWTsim_chunk001.py",
+            "env_RPL_FWTsim_trackfirst": "gops/env/env_FwFtracking/env_RPL_FWTsim_trackfirst.py",
+            "env_RPL_FWTsim_trackfirst001": "gops/env/env_FwFtracking/env_RPL_FWTsim_trackfirst001.py",
             "env_ToRwheelsim": "gops/env/env_FwFtracking/env_ToRwheelsim.py",
             "MPC_RL_env_ToRwheelsim": "gops/env/env_FwFtracking/MPC_RL_env_ToRwheelsim.py",
         }
-        env_path = env_map.get(env_id)
-        if env_path and os.path.isfile(env_path):
-            shutil.copy2(env_path, os.path.join(snapshot_dir, os.path.basename(env_path)))
+        env_paths = env_map.get(env_id)
+        if isinstance(env_paths, str):
+            env_paths = [env_paths]
+        for env_path in env_paths or []:
+            if env_path and os.path.isfile(env_path):
+                shutil.copy2(env_path, os.path.join(snapshot_dir, os.path.basename(env_path)))
 
         def _json_default(obj):
             if isinstance(obj, np.ndarray):

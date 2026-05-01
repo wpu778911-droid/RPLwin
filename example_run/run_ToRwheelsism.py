@@ -7,6 +7,7 @@
 import json
 import os
 import argparse
+import csv
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -14,22 +15,22 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-import ray
+from PIL import Image
 
 from gops.create_pkg.create_alg import create_alg
 from gops.create_pkg.create_env import create_env
-from gops.utils.init_args import init_args
 
 
 @dataclass
 class EvalConfig:
     # Paths and experiment setup
     checkpoint_path: str = (
-        "results/RPL_FWTsim001_yaw_v8_fresh/apprfunc/apprfunc_1047500_opt.pkl"
+        "results/RPL_FWTsim_chunk_histstack001_gamma2_clean_v1/apprfunc/apprfunc_1485000_opt.pkl"
     )
-    save_dir: str = "results/RPL_FWTsim001_yaw_v8_fresh/eval_apprfunc_1047500_opt"
-    env_id: str = "env_RPL_FWTsim001"
+    save_dir: str = "results/RPL_FWTsim_chunk_histstack001_gamma2_clean_v1/eval_apprfunc_1485000_opt"
+    env_id: Optional[str] = None
     algorithm: str = "DSACT"
+    traj_type: str = "rounded_rect"
     seed: int = 12345
     ref_time: float = None
     episode_steps: int = 1500
@@ -37,7 +38,7 @@ class EvalConfig:
     # Baseline (MPC) options
     run_baseline: bool = False
     baseline_script: str = "gops/env/env_FwFtracking/_ToRwheeLssim.py"
-    baseline_save_dir: str = "results/RPL_FWTsim001_yaw_v8_fresh/eval_apprfunc_1047500_opt_baseline_mpc"
+    baseline_save_dir: str = "results/RPL_FWTsim_chunk_histstack001_gamma2_clean_v1/eval_apprfunc_1485000_opt_baseline_mpc"
     baseline_side: float = -1.0
 
     # Evaluation options
@@ -47,6 +48,7 @@ class EvalConfig:
     save_anim: bool = True
     anim_fps: int = 30
     anim_format: str = "gif"  # "mp4" or "gif"
+    open_dir: bool = False
 
     # Environment parameters (optional overrides)
     dt: float = 0.05
@@ -156,7 +158,7 @@ def get_velocity(env) -> Tuple[float, float]:
 
 def action_to_rates(action: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     action = np.asarray(action, dtype=np.float32).reshape(-1)
-    if action.size == 24:
+    if action.size >= 8:
         action = action[:8]
     steer_rate = action[0::2]
     wheel_acc = action[1::2]
@@ -246,6 +248,26 @@ def make_series_labels(data: np.ndarray, prefix: str, base_names: List[str] = No
     return [f"{prefix}{i + 1}" for i in range(width)]
 
 
+def prepare_eval_args(env, args: Dict) -> Dict:
+    eval_args = dict(args)
+    torch.set_num_threads(4)
+    eval_args["use_gpu"] = False
+    eval_args["enable_cuda"] = False
+    eval_args["cnn_shared"] = eval_args.get("cnn_shared", False)
+
+    if "obsv_dim" not in eval_args:
+        eval_args["obsv_dim"] = env.observation_space.shape[0]
+    if "action_dim" not in eval_args:
+        eval_args["action_dim"] = env.action_space.shape[0]
+    if "action_type" not in eval_args:
+        eval_args["action_type"] = "continu"
+    if "action_high_limit" not in eval_args:
+        eval_args["action_high_limit"] = env.action_space.high.astype("float32")
+    if "action_low_limit" not in eval_args:
+        eval_args["action_low_limit"] = env.action_space.low.astype("float32")
+    return eval_args
+
+
 def get_reward_terms(step_info: Dict) -> Dict[str, float]:
     return {
         "reward_task": float(step_info.get("reward_task", 0.0)),
@@ -270,7 +292,6 @@ def evaluate_policy(config: EvalConfig) -> Dict[str, np.ndarray]:
         run_mpc_baseline(config, ref_time if ref_time is not None else 0.0)
 
     args = {
-        "env_id": config.env_id,
         "algorithm": config.algorithm,
         "seed": config.seed,
         "trainer": "off_serial_trainer",
@@ -287,6 +308,7 @@ def evaluate_policy(config: EvalConfig) -> Dict[str, np.ndarray]:
         "dt": config.dt,
         "t_total": config.t_total,
         "follow_dist": config.follow_dist,
+        "traj_type": config.traj_type,
         "episode_steps": config.episode_steps,
         "v_wheel_max": config.v_wheel_max,
         "w_max": config.w_max,
@@ -295,6 +317,8 @@ def evaluate_policy(config: EvalConfig) -> Dict[str, np.ndarray]:
         "steer_rate_max": config.steer_rate_max,
         "enable_cuda": False,
     }
+    if config.env_id is not None:
+        args["env_id"] = config.env_id
     # Merge training config if available (for apprfunc settings)
     result_dir = os.path.dirname(os.path.dirname(config.checkpoint_path))
     config_path = os.path.join(result_dir, "config.json")
@@ -310,7 +334,7 @@ def evaluate_policy(config: EvalConfig) -> Dict[str, np.ndarray]:
         args = merged
 
     env = create_env(**args)
-    args = init_args(env, **args)
+    args = prepare_eval_args(env, args)
     alg = create_alg(**args)
 
     # Load checkpoint
@@ -327,6 +351,12 @@ def evaluate_policy(config: EvalConfig) -> Dict[str, np.ndarray]:
         "mean_pos_err": [],
         "max_pos_err": [],
         "rms_pos_err": [],
+        "mean_abs_yaw_err": [],
+        "max_abs_yaw_err": [],
+        "mean_speed": [],
+        "max_speed": [],
+        "steps_taken": [],
+        "completed_full": [],
         "mean_ctrl_energy": [],
     }
 
@@ -406,7 +436,8 @@ def evaluate_policy(config: EvalConfig) -> Dict[str, np.ndarray]:
             slip_hist.append(slip_norm)
             util_hist.append(util_norm)
             sideslip_hist.append(sideslip)
-            time_hist.append(step * config.dt)
+            elapsed_steps = int(step_info.get("elapsed_steps", step + 1))
+            time_hist.append(elapsed_steps * config.dt)
             pose_hist.append((px, py, yaw))
             vel_hist.append((vx, vy))
             ep_return += float(reward)
@@ -418,11 +449,20 @@ def evaluate_policy(config: EvalConfig) -> Dict[str, np.ndarray]:
                 env.render()
 
         pos_err_arr = np.array(pos_err_hist, dtype=np.float32)
+        yaw_err_arr = np.array(yaw_err_hist, dtype=np.float32)
+        vel_arr = np.array(vel_hist, dtype=np.float32)
+        speed_arr = np.linalg.norm(vel_arr, axis=1) if vel_arr.size else np.zeros(1, dtype=np.float32)
         rms_pos = float(np.sqrt(np.mean(pos_err_arr ** 2)))
         results["episode_return"].append(ep_return)
         results["mean_pos_err"].append(float(np.mean(pos_err_arr)))
         results["max_pos_err"].append(float(np.max(pos_err_arr)))
         results["rms_pos_err"].append(rms_pos)
+        results["mean_abs_yaw_err"].append(float(np.mean(np.abs(yaw_err_arr))))
+        results["max_abs_yaw_err"].append(float(np.max(np.abs(yaw_err_arr))))
+        results["mean_speed"].append(float(np.mean(speed_arr)))
+        results["max_speed"].append(float(np.max(speed_arr)))
+        results["steps_taken"].append(float(step_info.get("elapsed_steps", step)))
+        results["completed_full"].append(float(step_info.get("elapsed_steps", step) >= config.episode_steps))
         results["mean_ctrl_energy"].append(float(np.mean(ctrl_energy_hist)))
         print(
             f"Episode {ep + 1} done: steps={step}, return={ep_return:.2f}, "
@@ -450,9 +490,10 @@ def evaluate_policy(config: EvalConfig) -> Dict[str, np.ndarray]:
                 slip_hist,
                 util_hist,
                 sideslip_hist,
+                time_hist,
+                vel_hist,
             )
-        if config.save_anim:
-            save_episode_animation(
+            save_episode_timeseries_csv(
                 config.save_dir,
                 ep,
                 time_hist,
@@ -460,19 +501,39 @@ def evaluate_policy(config: EvalConfig) -> Dict[str, np.ndarray]:
                 vel_hist,
                 traj_ref,
                 traj_ball,
+                pos_err_hist,
+                yaw_err_hist,
                 steer_angle_hist,
+                steer_rate_hist,
                 wheel_speed_hist,
-                slip_hist,
-                util_hist,
-                config.anim_fps,
-                config.anim_format,
-                config.dt,
+                wheel_acc_hist,
             )
+        if config.save_anim:
+            try:
+                save_episode_animation(
+                    config.save_dir,
+                    ep,
+                    time_hist,
+                    pose_hist,
+                    vel_hist,
+                    traj_ref,
+                    traj_ball,
+                    steer_angle_hist,
+                    wheel_speed_hist,
+                    slip_hist,
+                    util_hist,
+                    config.anim_fps,
+                    config.anim_format,
+                    config.dt,
+                )
+            except Exception as exc:
+                print(f"Warning: failed to save animation for episode {ep + 1}: {exc}")
 
     summarize_results(results)
+    save_eval_summary_csv(config.save_dir, results)
     print(f"Saved evaluation outputs to: {os.path.abspath(config.save_dir)}")
     try:
-        if os.name == "nt":
+        if config.open_dir and os.name == "nt":
             os.startfile(os.path.abspath(config.save_dir))
     except OSError:
         pass
@@ -499,6 +560,8 @@ def plot_episode(
     slip_hist: List[np.ndarray],
     util_hist: List[np.ndarray],
     sideslip_hist: List[float],
+    time_hist: List[float],
+    vel_hist: List[Tuple[float, float]],
 ) -> None:
     import matplotlib.pyplot as plt
 
@@ -512,6 +575,9 @@ def plot_episode(
     wheel_acc_hist = np.array(wheel_acc_hist)
     slip_hist = np.array(slip_hist)
     util_hist = np.array(util_hist)
+    time_arr = np.array(time_hist, dtype=np.float32)
+    vel_hist = np.array(vel_hist, dtype=np.float32)
+    speed_hist = np.linalg.norm(vel_hist, axis=1) if vel_hist.size else np.zeros(1, dtype=np.float32)
     base_wheel_names = list(WHEEL_POS.keys())
     steer_labels = make_series_labels(steer_angle_hist, "wheel_", base_wheel_names)
     rate_labels = make_series_labels(steer_rate_hist, "wheel_", base_wheel_names)
@@ -639,6 +705,106 @@ def plot_episode(
     fig3.tight_layout()
     fig3.savefig(os.path.join(save_dir, f"episode_{ep:03d}_steer_deg.png"))
     plt.close(fig3)
+
+    fig4 = plt.figure(figsize=(10, 6))
+    ax1 = fig4.add_subplot(2, 1, 1)
+    ax1.plot(time_arr, vel_hist[:, 0], label="vx")
+    ax1.plot(time_arr, vel_hist[:, 1], label="vy")
+    ax1.plot(time_arr, speed_hist, label="speed")
+    ax1.set_title("Robot Velocity")
+    ax1.set_xlabel("time (s)")
+    ax1.set_ylabel("m/s")
+    ax1.grid(True)
+    ax1.legend()
+
+    ax2 = fig4.add_subplot(2, 1, 2)
+    ax2.plot(time_arr, np.asarray(pos_err_hist, dtype=np.float32), label="position error")
+    ax2.plot(time_arr, np.rad2deg(np.asarray(yaw_err_hist, dtype=np.float32)), label="yaw error (deg)")
+    ax2.set_title("Tracking Error")
+    ax2.set_xlabel("time (s)")
+    ax2.grid(True)
+    ax2.legend()
+    fig4.tight_layout()
+    fig4.savefig(os.path.join(save_dir, f"episode_{ep:03d}_task1_velocity_error.png"))
+    plt.close(fig4)
+
+
+def save_episode_timeseries_csv(
+    save_dir: str,
+    ep: int,
+    time_hist: List[float],
+    pose_hist: List[Tuple[float, float, float]],
+    vel_hist: List[Tuple[float, float]],
+    traj_ref: List[Tuple[float, float]],
+    traj_ball: List[Tuple[float, float]],
+    pos_err_hist: List[float],
+    yaw_err_hist: List[float],
+    steer_angle_hist: List[np.ndarray],
+    steer_rate_hist: List[np.ndarray],
+    wheel_speed_hist: List[np.ndarray],
+    wheel_acc_hist: List[np.ndarray],
+) -> None:
+    wheel_names = list(WHEEL_POS.keys())
+    csv_path = os.path.join(save_dir, f"episode_{ep:03d}_timeseries.csv")
+    fieldnames = [
+        "time_s",
+        "robot_x",
+        "robot_y",
+        "robot_yaw_rad",
+        "robot_vx",
+        "robot_vy",
+        "robot_speed",
+        "ref_x",
+        "ref_y",
+        "target_x",
+        "target_y",
+        "pos_err",
+        "yaw_err_rad",
+        "yaw_err_deg",
+    ]
+    for name in wheel_names:
+        fieldnames.append(f"{name}_steer_deg")
+    for name in wheel_names:
+        fieldnames.append(f"{name}_steer_rate")
+    for name in wheel_names:
+        fieldnames.append(f"{name}_wheel_speed")
+    for name in wheel_names:
+        fieldnames.append(f"{name}_wheel_acc")
+
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for idx, time_s in enumerate(time_hist):
+            px, py, yaw = pose_hist[idx]
+            vx, vy = vel_hist[idx]
+            rx, ry = traj_ref[idx]
+            bx, by = traj_ball[idx]
+            row = {
+                "time_s": float(time_s),
+                "robot_x": float(px),
+                "robot_y": float(py),
+                "robot_yaw_rad": float(yaw),
+                "robot_vx": float(vx),
+                "robot_vy": float(vy),
+                "robot_speed": float(np.hypot(vx, vy)),
+                "ref_x": float(rx),
+                "ref_y": float(ry),
+                "target_x": float(bx),
+                "target_y": float(by),
+                "pos_err": float(pos_err_hist[idx]),
+                "yaw_err_rad": float(yaw_err_hist[idx]),
+                "yaw_err_deg": float(np.rad2deg(yaw_err_hist[idx])),
+            }
+            steer = np.rad2deg(np.asarray(steer_angle_hist[idx], dtype=np.float32))
+            steer_rate = np.asarray(steer_rate_hist[idx], dtype=np.float32)
+            wheel_speed = np.asarray(wheel_speed_hist[idx], dtype=np.float32)
+            wheel_acc = np.asarray(wheel_acc_hist[idx], dtype=np.float32)
+            for j, name in enumerate(wheel_names):
+                row[f"{name}_steer_deg"] = float(steer[j])
+                row[f"{name}_steer_rate"] = float(steer_rate[j])
+                row[f"{name}_wheel_speed"] = float(wheel_speed[j])
+                row[f"{name}_wheel_acc"] = float(wheel_acc[j])
+            writer.writerow(row)
 
 
 def save_episode_animation(
@@ -852,7 +1018,33 @@ def save_episode_animation(
         anim_format = "gif"
     anim_path = os.path.join(save_dir, f"episode_{ep:03d}.{anim_format}")
     if anim_format == "gif":
-        ani.save(anim_path, writer="pillow", fps=fps)
+        try:
+            ani.save(anim_path, writer="pillow", fps=fps)
+        except Exception:
+            # Fallback: render frames manually and let PIL assemble the GIF.
+            frames = []
+            init()
+            step = max(1, len(pose) // 300)
+            for i in range(0, len(pose), step):
+                update(i)
+                fig.canvas.draw()
+                w, h = fig.canvas.get_width_height()
+                rgba = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8).reshape(h, w, 4)
+                rgb = rgba[:, :, :3].copy()
+                frame = Image.fromarray(rgb, mode="RGB").quantize(colors=255)
+                frames.append(frame)
+            if not frames:
+                raise RuntimeError("No frames rendered for GIF export.")
+            duration_ms = max(1, int(1000 * step / max(fps, 1)))
+            frames[0].save(
+                anim_path,
+                save_all=True,
+                append_images=frames[1:],
+                duration=duration_ms,
+                loop=0,
+                optimize=False,
+                disposal=2,
+            )
     else:
         ani.save(anim_path, writer="ffmpeg", fps=fps)
     plt.close(fig)
@@ -868,7 +1060,23 @@ def summarize_results(results: Dict[str, List[float]]) -> None:
     _stat("mean_pos_err")
     _stat("max_pos_err")
     _stat("rms_pos_err")
+    _stat("mean_abs_yaw_err")
+    _stat("completed_full")
     _stat("mean_ctrl_energy")
+
+
+def save_eval_summary_csv(save_dir: str, results: Dict[str, List[float]]) -> None:
+    fieldnames = ["episode"] + list(results.keys())
+    max_len = max((len(v) for v in results.values()), default=0)
+    csv_path = os.path.join(save_dir, "summary.csv")
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for idx in range(max_len):
+            row = {"episode": idx}
+            for key, values in results.items():
+                row[key] = float(values[idx]) if idx < len(values) else ""
+            writer.writerow(row)
 
 
 def build_default_save_dir(checkpoint_path: str) -> str:
@@ -886,7 +1094,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="results/RPL_FWTsim001_yaw_v8_fresh/apprfunc/apprfunc_1047500_opt.pkl",
+        default=EvalConfig.checkpoint_path,
         help="Path to the policy checkpoint to evaluate.",
     )
     parser.add_argument(
@@ -896,8 +1104,16 @@ def parse_args() -> argparse.Namespace:
         help="Directory to save evaluation figures and animations. Defaults to a folder derived from checkpoint name.",
     )
     parser.add_argument("--episodes", type=int, default=3, help="Number of evaluation episodes.")
+    parser.add_argument("--episode-steps", type=int, default=EvalConfig.episode_steps, help="Maximum environment steps per episode.")
     parser.add_argument("--seed", type=int, default=12345, help="Evaluation seed.")
     parser.add_argument("--ref-time", type=float, default=0.0, help="Fixed reference start time for reset.")
+    parser.add_argument(
+        "--traj-type",
+        type=str,
+        default=EvalConfig.traj_type,
+        choices=["rounded_rect", "line_forward", "line_lateral", "line_diagonal", "circle", "s_curve"],
+        help="Reference trajectory used by the Python simulation environment.",
+    )
     parser.add_argument(
         "--render",
         dest="render",
@@ -944,6 +1160,7 @@ def parse_args() -> argparse.Namespace:
         choices=["gif", "mp4"],
         help="Animation format.",
     )
+    parser.add_argument("--open-dir", action="store_true", help="Open the output directory after evaluation.")
     return parser.parse_args()
 
 
@@ -954,13 +1171,16 @@ def make_eval_config(cli_args: argparse.Namespace) -> EvalConfig:
         checkpoint_path=checkpoint_path,
         save_dir=save_dir,
         baseline_save_dir=build_default_baseline_save_dir(save_dir),
+        traj_type=cli_args.traj_type,
         seed=cli_args.seed,
         ref_time=cli_args.ref_time,
+        episode_steps=cli_args.episode_steps,
         num_episodes=cli_args.episodes,
         render=cli_args.render,
         save_fig=cli_args.save_fig,
         save_anim=cli_args.save_anim,
         anim_format=cli_args.anim_format,
+        open_dir=cli_args.open_dir,
     )
 
 
@@ -969,5 +1189,3 @@ if __name__ == "__main__":
     eval_jobs = [make_eval_config(cli_args)]
     for cfg in eval_jobs:
         evaluate_policy(cfg)
-        if ray.is_initialized():
-            ray.shutdown()

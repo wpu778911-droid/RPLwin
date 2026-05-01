@@ -1,4 +1,4 @@
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from gym import spaces
@@ -461,6 +461,24 @@ class ToRwheelsimSeqScanEnv(Env):
         action_horizon: int = 3,
         safety_margin_ratio: float = 0.12,
         traj_type: str = "rounded_rect",
+        yaw_huber_weight: float = 5.5,
+        yaw_cos_weight: float = 3.0,
+        yaw_progress_weight: float = 3.0,
+        mode_reward_weight: float = 0.28,
+        mode_motion_weight: float = 0.10,
+        mode2_proto_scale: float = 1.0,
+        mode1_proto_peak_weight: float = 3.4,
+        mode1_target_pen_weight: float = 1.15,
+        mode1_spread_pen_weight: float = 0.65,
+        mode1_speed_pen_weight: float = 0.25,
+        mode1_safe_target_weight: float = 0.18,
+        mode1_safe_speed_weight: float = 0.10,
+        mode1_safe_steer_weight: float = 0.08,
+        plan_shift_weight: float = 0.0,
+        include_prev_plan_in_obs: bool = False,
+        prev_plan_obs_steps: int = 2,
+        temporal_ensemble_alpha: float = 0.0,
+        temporal_ensemble_decay: float = 0.5,
         **kwargs,
     ):
         self.robot = ToRwheelsimRobot(
@@ -482,8 +500,32 @@ class ToRwheelsimSeqScanEnv(Env):
         self.w_max = float(w_max)
         self.action_horizon = int(action_horizon)
         self.action_dim_per_step = 8
-        if self.action_horizon != 3:
-            raise ValueError("This environment is designed for action_horizon=3.")
+        if self.action_horizon < 1:
+            raise ValueError("action_horizon must be at least 1.")
+        self.yaw_huber_weight = float(yaw_huber_weight)
+        self.yaw_cos_weight = float(yaw_cos_weight)
+        self.yaw_progress_weight = float(yaw_progress_weight)
+        self.mode_reward_weight = float(mode_reward_weight)
+        self.mode_motion_weight = float(mode_motion_weight)
+        self.mode2_proto_scale = float(mode2_proto_scale)
+        self.mode1_proto_peak_weight = float(mode1_proto_peak_weight)
+        self.mode1_target_pen_weight = float(mode1_target_pen_weight)
+        self.mode1_spread_pen_weight = float(mode1_spread_pen_weight)
+        self.mode1_speed_pen_weight = float(mode1_speed_pen_weight)
+        self.mode1_safe_target_weight = float(mode1_safe_target_weight)
+        self.mode1_safe_speed_weight = float(mode1_safe_speed_weight)
+        self.mode1_safe_steer_weight = float(mode1_safe_steer_weight)
+        self.plan_shift_weight = float(plan_shift_weight)
+        self.include_prev_plan_in_obs = bool(include_prev_plan_in_obs)
+        self.prev_plan_obs_steps = int(max(0, min(prev_plan_obs_steps, self.action_horizon - 1)))
+        if not self.include_prev_plan_in_obs:
+            self.prev_plan_obs_steps = 0
+        self.temporal_ensemble_alpha = float(
+            np.clip(temporal_ensemble_alpha, 0.0, 0.95)
+        )
+        self.temporal_ensemble_decay = float(
+            np.clip(temporal_ensemble_decay, 0.0, 1.0)
+        )
 
         # Obs layout (32D):
         # A(4): B and R in body frame
@@ -492,7 +534,8 @@ class ToRwheelsimSeqScanEnv(Env):
         # D(3): chassis vx, vy, omega (body)
         # E(6): future R1/R2/R3 in body frame
         # F(16): per-wheel [cos(steer), sin(steer), norm_speed, margin]
-        obs_dim = 32
+        # Optional tail plan: previous unexecuted planned actions, normalized.
+        obs_dim = 32 + self.prev_plan_obs_steps * self.action_dim_per_step
         self.observation_space = spaces.Box(
             low=np.array([-np.inf] * obs_dim, dtype=np.float32),
             high=np.array([np.inf] * obs_dim, dtype=np.float32),
@@ -511,6 +554,13 @@ class ToRwheelsimSeqScanEnv(Env):
         self._safety_margin_ratio = float(safety_margin_ratio)
         self._debug_reward_terms: Dict[str, float] = {}
         self._last_exec_action = np.zeros(8, dtype=np.float32)
+        self._prev_action_seq = np.zeros(
+            (self.action_horizon, self.action_dim_per_step), dtype=np.float32
+        )
+        self._prev_action_seq_valid = False
+        self._action_plan_history: List[np.ndarray] = []
+        self._last_temporal_ensemble_sources = 1
+        self._last_temporal_ensemble_delta_pen = 0.0
         self._prev_ref_pos_err = 0.0
         self._prev_ref_vel_err = 0.0
         self._prev_yaw_err = 0.0
@@ -527,10 +577,57 @@ class ToRwheelsimSeqScanEnv(Env):
         action = np.asarray(action, dtype=np.float32).reshape(-1)
         action = clip(action, self.action_space.low, self.action_space.high)
         action_seq = action.reshape(self.action_horizon, self.action_dim_per_step)
-        # Actor outputs 3-step action sequence (24D), env executes only the first 8D now.
-        # The remaining planned actions are not executed here, but used for smoothness regularization.
+        # This base env executes only the first 8D action. If action_horizon > 1,
+        # the remaining planned actions can be used as a receding-horizon plan.
         action_exec = action_seq[0].copy()
         return action_seq, action_exec
+
+    def _action_norm(self) -> np.ndarray:
+        return np.array([
+            self.robot.steer_rate_max,
+            self.robot.wheel_acc_max,
+            self.robot.steer_rate_max,
+            self.robot.wheel_acc_max,
+            self.robot.steer_rate_max,
+            self.robot.wheel_acc_max,
+            self.robot.steer_rate_max,
+            self.robot.wheel_acc_max,
+        ], dtype=np.float32)
+
+    def _temporal_ensemble_action(
+        self, action_seq: np.ndarray, action_first: np.ndarray
+    ) -> np.ndarray:
+        alpha = self.temporal_ensemble_alpha
+        if alpha <= 0.0 or not self._action_plan_history:
+            self._last_temporal_ensemble_sources = 1
+            self._last_temporal_ensemble_delta_pen = 0.0
+            return action_first.copy()
+
+        preds = []
+        weights = []
+        for age, past_seq in enumerate(self._action_plan_history, start=1):
+            if age >= self.action_horizon:
+                break
+            preds.append(past_seq[age].copy())
+            weights.append(self.temporal_ensemble_decay ** (age - 1))
+
+        if not preds or float(np.sum(weights)) <= 1e-9:
+            self._last_temporal_ensemble_sources = 1
+            self._last_temporal_ensemble_delta_pen = 0.0
+            return action_first.copy()
+
+        weights_arr = np.asarray(weights, dtype=np.float32)
+        weights_arr = weights_arr / max(float(np.sum(weights_arr)), 1e-9)
+        history_action = np.sum(
+            np.stack(preds, axis=0) * weights_arr[:, None], axis=0
+        )
+        action_exec = (1.0 - alpha) * action_first + alpha * history_action
+        action_exec = clip(action_exec, self.robot.action_space.low, self.robot.action_space.high)
+
+        diff = (action_exec - action_first) / np.maximum(self._action_norm(), 1e-6)
+        self._last_temporal_ensemble_sources = 1 + len(preds)
+        self._last_temporal_ensemble_delta_pen = float(np.sum(diff**2))
+        return action_exec.astype(np.float32)
 
     def _target_and_ref_world(self) -> Tuple[float, float, float, float, float, float, float]:
         px, py, yaw = self.robot.state
@@ -671,6 +768,23 @@ class ToRwheelsimSeqScanEnv(Env):
                 ]
             )
 
+        prev_plan_feats = []
+        if self.prev_plan_obs_steps > 0:
+            if self._prev_action_seq_valid:
+                tail = self._prev_action_seq[1 : 1 + self.prev_plan_obs_steps]
+            else:
+                tail = np.zeros(
+                    (0, self.action_dim_per_step), dtype=np.float32
+                )
+            if tail.shape[0] < self.prev_plan_obs_steps:
+                pad = np.zeros(
+                    (self.prev_plan_obs_steps - tail.shape[0], self.action_dim_per_step),
+                    dtype=np.float32,
+                )
+                tail = np.vstack([tail, pad])
+            tail_norm = tail / np.maximum(self._action_norm(), 1e-6)
+            prev_plan_feats = np.clip(tail_norm, -1.0, 1.0).reshape(-1).tolist()
+
         obs = np.array(
             [
                 x_B_body,
@@ -685,6 +799,7 @@ class ToRwheelsimSeqScanEnv(Env):
                 w_b,
                 *preview_body.tolist(),
                 *wheel_feats,
+                *prev_plan_feats,
             ],
             dtype=np.float32,
         )
@@ -699,16 +814,23 @@ class ToRwheelsimSeqScanEnv(Env):
         spread_rms = _angle_rms_to(steer_angles, mean_angle)
         speed_rms = float(np.sqrt(np.mean((speeds - np.mean(speeds)) ** 2)))
 
-        target_score = _soft_gauss(target_rms, np.deg2rad(10.0))
+        target_score = _soft_gauss(target_rms, np.deg2rad(18.0))
+        target_dense_score = 1.0 / (
+            1.0 + (target_rms / max(np.deg2rad(24.0), 1e-6)) ** 2
+        )
         spread_score = _soft_gauss(spread_rms, np.deg2rad(5.5))
         speed_score = _soft_gauss(speed_rms, 0.08)
-        peak = (target_score ** 0.55) * (spread_score ** 0.30) * (speed_score ** 0.15)
+
+        target_pen = min((target_rms / max(np.deg2rad(45.0), 1e-6)) ** 1.25, 3.0)
+        coherence_score = 0.65 * spread_score + 0.35 * speed_score
+        target_mix = 0.65 * target_score + 0.35 * target_dense_score
+        peak = target_mix * coherence_score
         miss = (
-            0.55 * (1.0 - target_score)
-            + 0.75 * (1.0 - spread_score)
-            + 0.35 * (1.0 - speed_score)
+            self.mode1_target_pen_weight * target_pen
+            + self.mode1_spread_pen_weight * (1.0 - spread_score)
+            + self.mode1_speed_pen_weight * (1.0 - speed_score)
         )
-        return float(3.0 * peak - miss)
+        return float(self.mode1_proto_peak_weight * peak - miss)
 
     def _mode_proto_2(
         self,
@@ -806,11 +928,11 @@ class ToRwheelsimSeqScanEnv(Env):
         yaw_err = float(abs(wrap_to_pi(self.robot.state[2] - geom["yaw_face"])))
         w_pos = 7.5
         w_vel = 1.2
-        w_yaw_huber = 5.5
-        w_yaw_cos = 3.0
+        w_yaw_huber = self.yaw_huber_weight
+        w_yaw_cos = self.yaw_cos_weight
         w_prog_pos = 1.2
         w_prog_vel = 0.4
-        w_prog_yaw = 3.0
+        w_prog_yaw = self.yaw_progress_weight
         r_pos = -w_pos * huber_loss(pos_err, delta=0.30)
         r_vel = -w_vel * huber_loss(vel_err, delta=0.20)
         r_yaw = (
@@ -831,9 +953,11 @@ class ToRwheelsimSeqScanEnv(Env):
         a1 = a1 / mode_norm
         a2 = a2 / mode_norm
         m1 = self._mode_proto_1(tangent, steer_angles, speeds)
-        m2 = self._mode_proto_2(tangent, steer_angles, speeds, a2)
+        m2 = self.mode2_proto_scale * self._mode_proto_2(tangent, steer_angles, speeds, a2)
         mode_raw = float(a1 * m1 + a2 * m2)
         mode1_focus = smoothstep(a1, 0.80, 0.95)
+        mode1_target_angle = float(np.arctan2(tangent[1], tangent[0]))
+        mode1_target_rms = _angle_rms_to(steer_angles, mode1_target_angle)
         mode1_speed_var = float(np.mean((speeds - np.mean(speeds)) ** 2))
         mode1_mean_angle = _circular_mean(steer_angles)
         mode1_steer_spread = float(
@@ -886,7 +1010,10 @@ class ToRwheelsimSeqScanEnv(Env):
             + 0.30 * slip_rms**2
         )
 
-        r_mode = 0.28 * task_gate * safety_gate * mode_raw - 0.10 * mode_motion_penalty
+        r_mode = (
+            self.mode_reward_weight * task_gate * safety_gate * mode_raw
+            - self.mode_motion_weight * mode_motion_penalty
+        )
 
         r_safe = (
             -0.45 * near_penalty
@@ -899,17 +1026,12 @@ class ToRwheelsimSeqScanEnv(Env):
         straight_steer_pen = float(
             mode1_focus * mode1_steer_spread / max(np.deg2rad(20.0) ** 2, 1e-6)
         )
+        straight_target_pen = float(
+            mode1_focus
+            * min((mode1_target_rms / max(np.deg2rad(45.0), 1e-6)) ** 2, 4.0)
+        )
 
-        act_norm = np.array([
-            self.robot.steer_rate_max,
-            self.robot.wheel_acc_max,
-            self.robot.steer_rate_max,
-            self.robot.wheel_acc_max,
-            self.robot.steer_rate_max,
-            self.robot.wheel_acc_max,
-            self.robot.steer_rate_max,
-            self.robot.wheel_acc_max,
-        ], dtype=np.float32)
+        act_norm = self._action_norm()
         a0n = action_exec / np.maximum(act_norm, 1e-6)
         mag_pen = float(np.sum(a0n**2))
 
@@ -922,19 +1044,36 @@ class ToRwheelsimSeqScanEnv(Env):
             ak1 = action_seq[k + 1] / np.maximum(act_norm, 1e-6)
             seq_pen += float(np.sum((ak1 - ak) ** 2))
 
+        plan_shift_pen = 0.0
+        if (
+            self.plan_shift_weight > 0.0
+            and self._prev_action_seq_valid
+            and self.action_horizon > 1
+        ):
+            prev_tail = self._prev_action_seq[1:]
+            curr_head = action_seq[:-1]
+            n_shift = min(prev_tail.shape[0], curr_head.shape[0])
+            for k in range(n_shift):
+                weight = 1.0 if k == 0 else 0.5
+                prev_k = prev_tail[k] / np.maximum(act_norm, 1e-6)
+                curr_k = curr_head[k] / np.maximum(act_norm, 1e-6)
+                plan_shift_pen += float(weight * np.sum((curr_k - prev_k) ** 2))
+
         w_body = float(self.robot.w_body)
         yaw_acc = (w_body - self._prev_w_body) / max(self.dt, 1e-6)
         yaw_smooth_pen = float((w_body / max(self.w_max, 1e-6)) ** 2 + 0.2 * yaw_acc**2)
 
         r_safe += (
-            -0.10 * straight_speed_pen
-            -0.08 * straight_steer_pen
+            -self.mode1_safe_target_weight * straight_target_pen
+            -self.mode1_safe_speed_weight * straight_speed_pen
+            -self.mode1_safe_steer_weight * straight_steer_pen
         )
 
         r_smooth = (
             -0.012 * mag_pen
             -0.015 * delta_pen
             -0.008 * seq_pen
+            -self.plan_shift_weight * plan_shift_pen
             -0.004 * yaw_smooth_pen
         )
 
@@ -957,8 +1096,15 @@ class ToRwheelsimSeqScanEnv(Env):
             "mode1_focus": float(mode1_focus),
             "straight_speed_pen": float(straight_speed_pen),
             "straight_steer_pen": float(straight_steer_pen),
+            "straight_target_pen": float(straight_target_pen),
             "straight_speed_var": float(mode1_speed_var),
             "straight_steer_spread": float(mode1_steer_spread),
+            "mode1_target_rms": float(mode1_target_rms),
+            "seq_action_pen": float(seq_pen),
+            "plan_shift_pen": float(plan_shift_pen),
+            "temporal_ensemble_alpha": float(self.temporal_ensemble_alpha),
+            "temporal_ensemble_sources": float(self._last_temporal_ensemble_sources),
+            "temporal_ensemble_delta_pen": float(self._last_temporal_ensemble_delta_pen),
             "flip_count": float(self.robot.last_flip_count),
             "min_margin": float(margin_min),
             "ref_pos_error": float(pos_err),
@@ -977,6 +1123,12 @@ class ToRwheelsimSeqScanEnv(Env):
             self._prev_yaw_err = yaw_err
             self._yaw_ref_prev = float(geom["yaw_face"])
             self._last_exec_action = action_exec.copy()
+            self._prev_action_seq = action_seq.copy()
+            self._prev_action_seq_valid = True
+            self._action_plan_history.insert(0, action_seq.copy())
+            max_history = max(0, self.action_horizon - 1)
+            if len(self._action_plan_history) > max_history:
+                del self._action_plan_history[max_history:]
             self._prev_speed_sign = cur_sign
             self._prev_w_body = w_body
             self._flip_total += int(self.robot.last_flip_count)
@@ -1041,6 +1193,13 @@ class ToRwheelsimSeqScanEnv(Env):
         self._prev_yaw_err = float(abs(wrap_to_pi(init_state[2] - yaw_ref)))
         self._yaw_ref_prev = float(yaw_ref)
         self._last_exec_action = np.zeros(8, dtype=np.float32)
+        self._prev_action_seq = np.zeros(
+            (self.action_horizon, self.action_dim_per_step), dtype=np.float32
+        )
+        self._prev_action_seq_valid = False
+        self._action_plan_history = []
+        self._last_temporal_ensemble_sources = 1
+        self._last_temporal_ensemble_delta_pen = 0.0
         self._prev_speed_sign = np.zeros(4, dtype=np.float32)
         self._prev_w_body = 0.0
         self._flip_total = 0
@@ -1053,15 +1212,16 @@ class ToRwheelsimSeqScanEnv(Env):
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, dict]:
         # Required step flow:
-        # 1) receive 24D action
-        # 2) reshape to (3, 8)
+        # 1) receive action_horizon * 8D action
+        # 2) reshape to (action_horizon, 8)
         # 3) execute only first action
         # 4) robot applies traditional steering-limit safety shell
         # 5) update context
         # 6) update env state
         # 7) compute reward
         # 8) return obs, reward, done, info
-        action_seq, action_exec = self._split_action(action)
+        action_seq, action_first = self._split_action(action)
+        action_exec = self._temporal_ensemble_action(action_seq, action_first)
 
         robot_state_next = self.robot.step(action_exec)
         context_state_next = self.context.step()
@@ -1083,7 +1243,8 @@ class ToRwheelsimSeqScanEnv(Env):
 
     def _get_reward(self, action: np.ndarray) -> float:
         # Unused because step() is overridden to follow the required sequence.
-        action_seq, action_exec = self._split_action(action)
+        action_seq, action_first = self._split_action(action)
+        action_exec = self._temporal_ensemble_action(action_seq, action_first)
         reward, _ = self._compute_reward(action_seq, action_exec, update_cache=False)
         return reward
 

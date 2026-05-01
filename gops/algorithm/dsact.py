@@ -245,7 +245,14 @@ class DSACT(AlgorithmBase):
             data["obs2"],
             data["done"],
         )
-        discount_steps = data.get("next_discount_steps", torch.ones_like(done))
+        # Normal one-step envs do not provide discount_steps, while action-chunk
+        # envs store the macro-transition length. Defaulting to 1 keeps the TD
+        # target exactly single-step for non-chunk training.
+        discount_steps = data.get(
+            "next_discount_steps",
+            data.get("discount_steps", torch.ones_like(done)),
+        )
+        discount_steps = discount_steps.to(device=done.device, dtype=done.dtype).clamp_min(1.0)
         logits_2 = self.networks.policy_target(obs2)
         act2_dist = self.networks.create_action_distributions(logits_2)
         act2, log_prob_act2 = act2_dist.rsample()
